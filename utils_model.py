@@ -8,6 +8,11 @@ import torch
 from transformers import LlavaForConditionalGeneration, AutoProcessor
 from transformers import BitsAndBytesConfig
 
+try:
+    from transformers import Qwen3VLForConditionalGeneration
+except ImportError:  # pragma: no cover - optional dependency for newer transformers versions
+    Qwen3VLForConditionalGeneration = None
+
 func_to_enable_grad = '_sample'
 setattr(LlavaForConditionalGeneration, func_to_enable_grad, torch.enable_grad(getattr(LlavaForConditionalGeneration, func_to_enable_grad)))
 
@@ -19,7 +24,8 @@ except ModuleNotFoundError:
 logger = logging.getLogger(__name__)
 
 def get_processor_model(args):
-    #outputs: attn_output, attn_weights, past_key_value
+    """Load processor + model pair with attention hooks for interpretability."""
+
     processor = AutoProcessor.from_pretrained(args.model_name_or_path)
 
     if args.load_4bit:
@@ -27,66 +33,161 @@ def get_processor_model(args):
             load_in_4bit=True,
             bnb_4bit_quant_type="nf4",
             bnb_4bit_use_double_quant=True,
-            bnb_4bit_compute_dtype=torch.bfloat16
+            bnb_4bit_compute_dtype=torch.bfloat16,
         )
     elif args.load_8bit:
-        quant_config = BitsAndBytesConfig(
-            load_in_8bit=True
-        )
+        quant_config = BitsAndBytesConfig(load_in_8bit=True)
     else:
         quant_config = None
 
-    model = LlavaForConditionalGeneration.from_pretrained(
-        args.model_name_or_path, torch_dtype=torch.bfloat16, 
-        quantization_config=quant_config, low_cpu_mem_usage=True, device_map=args.device_map
+    model_kwargs = dict(
+        quantization_config=quant_config,
+        low_cpu_mem_usage=True,
+        device_map=args.device_map,
     )
-    model.vision_tower.config.output_attentions = True
+    if quant_config is None:
+        # Keep higher precision by default for interpretability gradients
+        model_kwargs["torch_dtype"] = torch.bfloat16
 
-    # Relevancy map
-    # set hooks to get attention weights
-    model.enc_attn_weights = []
-    #outputs: attn_output, attn_weights, past_key_value
-    def forward_hook(module, inputs, output): 
-        if output[1] is None:
-            logger.error(
-                ("Attention weights were not returned for the encoder. "
-                "To enable, set output_attentions=True in the forward pass of the model. ")
+    model_name_lower = args.model_name_or_path.lower()
+    is_qwen = "qwen" in model_name_lower
+
+    if is_qwen:
+        if Qwen3VLForConditionalGeneration is None:
+            raise ImportError(
+                "transformers.Qwen3VLForConditionalGeneration is unavailable. "
+                "Please upgrade transformers to a version that includes Qwen3."
             )
-            return output
-        
-        output[1].requires_grad_(True)
-        output[1].retain_grad()
-        model.enc_attn_weights.append(output[1])
-        return output
+        ModelClass = Qwen3VLForConditionalGeneration
+    else:
+        ModelClass = LlavaForConditionalGeneration
 
-    hooks_pre_encoder, hooks_encoder = [], []
-    for layer in model.language_model.model.layers:
-        hook_encoder_layer = layer.self_attn.register_forward_hook(forward_hook)
-        hooks_pre_encoder.append(hook_encoder_layer)
+    model = ModelClass.from_pretrained(args.model_name_or_path, **model_kwargs)
+    model._lvlim_model_type = "qwen" if is_qwen else "llava"
 
+    if hasattr(model, "vision_tower") and hasattr(model.vision_tower, "config"):
+        if hasattr(model.vision_tower.config, "output_attentions"):
+            model.vision_tower.config.output_attentions = True
+    if hasattr(model, "visual") and hasattr(model.visual, "config"):
+        if hasattr(model.visual.config, "output_attentions"):
+            model.visual.config.output_attentions = True
+
+    _register_attention_hooks(model)
+    return processor, model
+
+
+def _register_attention_hooks(model):
+    """Attach forward hooks that capture attention tensors for later gradient processing."""
+
+    model.enc_attn_weights = []
     model.enc_attn_weights_vit = []
 
+    text_layers = _resolve_text_layers(model)
+    vision_layers = _resolve_vision_layers(model)
 
-    def forward_hook_image_processor(module, inputs, output): 
-        if output[1] is None:
-            logger.warning(
-                ("Attention weights were not returned for the vision model. "
-                 "Relevancy maps will not be calculated for the vision model. " 
-                 "To enable, set output_attentions=True in the forward pass of vision_tower. ")
-            )
+    def _extract_attention_tensor(output):
+        if isinstance(output, tuple):
+            # (attn_output, attn_weights, ...)
+            if len(output) >= 2:
+                return output[1]
+        elif isinstance(output, dict):
+            for key in ("attn_weights", "attentions"):
+                if key in output:
+                    return output[key]
+        return None
+
+    def _make_hook(storage, warn_message):
+        def _hook(module, inputs, output):  # noqa: D401 - signature defined by PyTorch
+            attn_tensor = _extract_attention_tensor(output)
+            if attn_tensor is None:
+                if not getattr(module, "_lvlim_warned_missing_attn", False):
+                    logger.warning(warn_message)
+                    setattr(module, "_lvlim_warned_missing_attn", True)
+                return output
+            if isinstance(attn_tensor, (tuple, list)):
+                attn_tensor = attn_tensor[0]
+            if not isinstance(attn_tensor, torch.Tensor):
+                if not getattr(module, "_lvlim_warned_attn_type", False):
+                    logger.warning("Unexpected attention payload type %s", type(attn_tensor))
+                    setattr(module, "_lvlim_warned_attn_type", True)
+                return output
+            attn_tensor.requires_grad_(True)
+            attn_tensor.retain_grad()
+            storage.append(attn_tensor)
             return output
 
-        output[1].requires_grad_(True)
-        output[1].retain_grad()
-        model.enc_attn_weights_vit.append(output[1])
-        return output
+        return _hook
 
-    hooks_pre_encoder_vit = []
-    for layer in model.vision_tower.vision_model.encoder.layers:
-        hook_encoder_layer_vit = layer.self_attn.register_forward_hook(forward_hook_image_processor)
-        hooks_pre_encoder_vit.append(hook_encoder_layer_vit)
-    
-    return processor, model
+    text_hook = _make_hook(
+        model.enc_attn_weights,
+        "Attention weights were not returned for the language model. "
+        "Ensure output_attentions=True and disable flash attention backends for interpretability.",
+    )
+    vision_hook = _make_hook(
+        model.enc_attn_weights_vit,
+        "Attention weights were not returned for the vision model. "
+        "Vision-level relevancy maps will be unavailable.",
+    )
+
+    model._lvlim_text_hooks = []
+    for layer in text_layers:
+        attn_module = getattr(layer, "self_attn", None) or getattr(layer, "self_attention", None)
+        if attn_module is None:
+            continue
+        handle = attn_module.register_forward_hook(text_hook)
+        model._lvlim_text_hooks.append(handle)
+
+    model._lvlim_vision_hooks = []
+    for layer in vision_layers:
+        attn_module = getattr(layer, "self_attn", None) or getattr(layer, "attn", None)
+        if attn_module is None:
+            continue
+        handle = attn_module.register_forward_hook(vision_hook)
+        model._lvlim_vision_hooks.append(handle)
+
+
+def _resolve_text_layers(model):
+    """Return an iterable of decoder layers for the language backbone."""
+
+    candidates = (
+        ("language_model", "model", "layers"),
+        ("language_model", "layers"),
+        ("model", "language_model", "model", "layers"),
+        ("model", "language_model", "layers"),
+    )
+
+    for chain in candidates:
+        obj = model
+        for attr in chain:
+            obj = getattr(obj, attr, None)
+            if obj is None:
+                break
+        if obj is not None:
+            return list(obj)
+    logger.warning("Could not locate language model layers for attention hooks.")
+    return []
+
+
+def _resolve_vision_layers(model):
+    """Return an iterable of vision encoder layers where attention can be captured."""
+
+    candidates = (
+        ("vision_tower", "vision_model", "encoder", "layers"),
+        ("vision_tower", "vision_model", "layers"),
+        ("visual", "blocks"),
+        ("model", "visual", "blocks"),
+    )
+
+    for chain in candidates:
+        obj = model
+        for attr in chain:
+            obj = getattr(obj, attr, None)
+            if obj is None:
+                break
+        if obj is not None:
+            return list(obj)
+    logger.warning("Could not locate vision encoder layers for attention hooks.")
+    return []
 
 def process_image(image, image_process_mode, return_pil=False, image_format='PNG', max_len=1344, min_len=672):
     if image_process_mode == "Pad":
@@ -159,4 +260,3 @@ def move_to_device(input, device='cpu'):
         return dict( ((k, move_to_device(v)) for k,v in input.items()))
     else:
         raise ValueError(f"Unknown data type for {input.type}")
-

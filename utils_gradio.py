@@ -62,75 +62,147 @@ block_css = """
 
 """
 
+def _resolve_image_token_id(model, processor):
+    """Best-effort lookup of the image token id used by the current model."""
+
+    config = getattr(model, "config", None)
+    for attr in ("image_token_index", "image_token_id"):
+        value = getattr(config, attr, None)
+        if value is not None:
+            return value
+
+    for owner in (processor, getattr(processor, "tokenizer", None)):
+        if owner is None:
+            continue
+        for attr in ("image_token_index", "image_token_id"):
+            value = getattr(owner, attr, None)
+            if value is not None:
+                return value
+
+    raise ValueError("Unable to infer image token id for the selected model.")
+
 def clear_history(request: gr.Request):
     logger.info(f"clear_history. ip: {request.client.host}")
     state = gr.State()
     state.messages = []
+    state.chat_history = []
     return (state, [], "", None, None, None, None)
 
 def add_text(state, text, image, image_process_mode):
     global processor
-    
-    if True: # state is None:
+    global model
+
+    if state is None or not hasattr(state, "messages"):
         state = gr.State()
         state.messages = []
-        
+
     if isinstance(image, dict):
         image = image['composite']
         background = Image.new('RGBA', image.size, (255, 255, 255))
         image = Image.alpha_composite(background, image).convert('RGB')
 
         # ImageEditor does not return None image
-        if (np.array(image)==255).all():
-            image =None
+        if (np.array(image) == 255).all():
+            image = None
 
     text = text[:1536]  # Hard cut-off
     logger.info(text)
 
-    prompt_len = 0
-    # prompt=f"[INST] {system_prompt} [/INST]\n\n" if system_prompt else ""
-    if processor.tokenizer.chat_template is not None:
-        prompt = processor.tokenizer.apply_chat_template(
-            [{"role": "user", "content": "<image>\n" + text}],
-            tokenize=False,
-            add_generation_prompt=True,
-        )
-        prompt_len += len(prompt)
-    else:
-        prompt = system_prompt
-        prompt_len += len(prompt)
-        if image is not None:
-            msg = f"\n{ROLE0}: <image>\n{text}\n{ROLE1}:" # Ignore <image> token when calculating prompt length\     
-        else:
-            msg = f"\n{ROLE0}: {text}\n{ROLE1}: "
-        prompt += msg
-        prompt_len += len(msg)
-
-    state.messages.append([ROLE0,  (text, image, image_process_mode)])
+    state.messages.append([ROLE0, (text, image, image_process_mode)])
     state.messages.append([ROLE1, None])
+
+    processed_image = process_image(image, image_process_mode, return_pil=True) if image is not None else None
+    state.image = processed_image
+
+    using_qwen = getattr(model, "_lvlim_model_type", "") == "qwen"
+
+    prompt_len = 0
+    if using_qwen:
+        chat_history = getattr(state, "chat_history", None)
+        if chat_history is None:
+            chat_history = []
+            if system_prompt:
+                chat_history.append({
+                    "role": "system",
+                    "content": [{"type": "text", "text": system_prompt}]
+                })
+            state.chat_history = chat_history
+
+        content_blocks = []
+        if processed_image is not None:
+            content_blocks.append({"type": "image", "image": processed_image})
+        content_blocks.append({"type": "text", "text": text})
+        chat_history.append({"role": ROLE0.lower(), "content": content_blocks})
+
+        if hasattr(processor, "tokenizer") and processor.tokenizer.chat_template is not None:
+            prompt = processor.tokenizer.apply_chat_template(
+                chat_history,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+            prompt_len = len(prompt)
+        else:
+            prompt = text
+            prompt_len = len(prompt)
+    else:
+        if processor.tokenizer.chat_template is not None:
+            prompt = processor.tokenizer.apply_chat_template(
+                [{"role": "user", "content": "<image>\n" + text}],
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+            prompt_len = len(prompt)
+        else:
+            prompt = system_prompt
+            prompt_len = len(prompt)
+            if image is not None:
+                msg = f"\n{ROLE0}: <image>\n{text}\n{ROLE1}:"
+            else:
+                msg = f"\n{ROLE0}: {text}\n{ROLE1}: "
+            prompt += msg
+            prompt_len += len(msg)
 
     state.prompt_len = prompt_len
     state.prompt = prompt
-    state.image = process_image(image, image_process_mode, return_pil=True)
 
     return (state, to_gradio_chatbot(state), "", None)
 
 
 @spaces.GPU
 def lvlm_bot(state, temperature, top_p, max_new_tokens):   
-    prompt = state.prompt
-    prompt_len = state.prompt_len
-    image = state.image
-    
-    inputs = processor(prompt, image, return_tensors="pt").to(model.device)
-    input_ids = inputs.input_ids
-    img_idx = torch.where(input_ids==model.config.image_token_index)[1][0].item()
-    do_sample = True if temperature > 0.001 else False
+    prompt = getattr(state, "prompt", "")
+    prompt_len = getattr(state, "prompt_len", 0)
+    image = getattr(state, "image", None)
+
+    using_qwen = getattr(model, "_lvlim_model_type", "") == "qwen"
+
+    if using_qwen:
+        chat_history = getattr(state, "chat_history", None)
+        if not chat_history:
+            raise gr.Error("No conversation history available. Please submit a prompt with an image first.")
+        inputs = processor.apply_chat_template(
+            chat_history,
+            tokenize=True,
+            add_generation_prompt=True,
+            return_dict=True,
+            return_tensors="pt",
+        ).to(model.device)
+        input_ids = inputs.input_ids if hasattr(inputs, "input_ids") else inputs["input_ids"]
+    else:
+        inputs = processor(prompt, image, return_tensors="pt").to(model.device)
+        input_ids = inputs.input_ids
+
+    image_token_id = _resolve_image_token_id(model, processor)
+    img_token_positions = torch.where(input_ids == image_token_id)
+    if len(img_token_positions[0]) == 0:
+        raise gr.Error("Unable to locate the image token in the prompt. Ensure an image is provided.")
+    img_idx = img_token_positions[1][0].item()
+    do_sample = temperature > 0.001
     # Generate
     model.enc_attn_weights = []
     model.enc_attn_weights_vit = []
 
-    if model.language_model.config.model_type == "gemma":
+    if hasattr(model, "language_model") and getattr(model.language_model.config, "model_type", "") == "gemma":
         eos_token_id = processor.tokenizer('<end_of_turn>', add_special_tokens=False).input_ids[0]
     else:
         eos_token_id = processor.tokenizer.eos_token_id
@@ -149,12 +221,20 @@ def lvlm_bot(state, temperature, top_p, max_new_tokens):
         )
 
     input_ids_list = input_ids.reshape(-1).tolist()
-    input_ids_list[img_idx] = 0
-    input_text = processor.tokenizer.decode(input_ids_list) # eg. "<s> You are a helpful ..."
+    replacement_token_id = getattr(processor.tokenizer, "pad_token_id", None)
+    if replacement_token_id is None:
+        replacement_token_id = getattr(processor.tokenizer, "eos_token_id", 0)
+    masked_input_ids = input_ids_list.copy()
+    if img_idx < len(masked_input_ids):
+        masked_input_ids[img_idx] = replacement_token_id
+
+    input_text = processor.tokenizer.decode(masked_input_ids, skip_special_tokens=False)
     if input_text.startswith("<s> "):
-        input_text = '<s>' + input_text[4:] # Remove the first space after <s> to maintain correct length
-    input_text_tokenized = processor.tokenizer.tokenize(input_text) # eg. ['<s>', '▁You', '▁are', '▁a', '▁helpful', ... ]
-    input_text_tokenized[img_idx] = "average_image"
+        input_text = '<s>' + input_text[4:]
+    input_tokens = processor.tokenizer.convert_ids_to_tokens(input_ids_list)
+    if img_idx < len(input_tokens):
+        input_tokens[img_idx] = "average_image"
+    input_text_tokenized = input_tokens
     
     output_ids = outputs.sequences.reshape(-1)[input_ids.shape[-1]:].tolist()  
 
@@ -167,6 +247,20 @@ def lvlm_bot(state, temperature, top_p, max_new_tokens):
     logger.debug(f"generated_text_tokenized: {generated_text_tokenized}")
 
     state.messages[-1][-1] = generated_text[:-len('</s>')] if generated_text.endswith('</s>') else generated_text
+
+    if using_qwen:
+        assistant_reply = state.messages[-1][-1]
+        state.chat_history.append({
+            "role": ROLE1.lower(),
+            "content": [{"type": "text", "text": assistant_reply}],
+        })
+        if hasattr(processor, "tokenizer") and processor.tokenizer.chat_template is not None:
+            prompt = processor.tokenizer.apply_chat_template(
+                state.chat_history,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+            prompt_len = len(prompt)
 
     tempdir = os.getenv('TMPDIR', '/tmp/')
     tempfilename = tempfile.NamedTemporaryFile(dir=tempdir)
@@ -204,6 +298,8 @@ def lvlm_bot(state, temperature, top_p, max_new_tokens):
     img_recover = inputs.pixel_values[0].cpu() * img_std + img_mean
     img_recover = to_pil_image(img_recover)
 
+    state.prompt = prompt
+    state.prompt_len = prompt_len
     state.recovered_image = img_recover
     state.input_text_tokenized = input_text_tokenized
     state.output_ids_decoded = output_ids_decoded 
@@ -534,4 +630,3 @@ def build_demo(args, embed_mode=False):
         
 
     return demo
-
